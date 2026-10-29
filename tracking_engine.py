@@ -18,6 +18,7 @@
 #        g. 异常跳变检测: 残差过大的匹配不输出, 防止错误关联传播
 #   3. 没有匹配上的关节按阻尼速度外推 (coast), 而不是原地冻结;
 #      连续丢失过久停止外推, 由上层调用者 reseed 到标定位置重新捕获
+#
 
 import numpy as np
 import cv2
@@ -102,7 +103,7 @@ class MotionPredictor:
     def update(self, measured, dt=1.0):
         """
         measured: {jid: (x, y)} 本帧实测 (只含真正匹配上的关节)
-        dt: 相对于正常帧间隔的倍数 (1.0 = 正常)
+        dt: 相对于正常帧间隔的倍数 (1.0=正常)
         """
         dt = float(np.clip(dt, 0.25, 3.0))
         meas = {int(j): (float(p[0]), float(p[1]))
@@ -155,7 +156,7 @@ class MotionPredictor:
 
             # 动态纠正: 高速增响应, 低速减抖动
             alpha = float(np.clip(self.alpha + 0.0015 * spd,
-                                  self.alpha, 0.96))
+                                   self.alpha, 0.96))
             beta = float(np.clip(self.beta + 0.001 * spd,
                                  self.beta, 0.75))
 
@@ -301,10 +302,26 @@ class MarkerAssociator:
         if jid <= 6: return 120
         return 160
 
+    def _body_center_x(self):
+        """估算身体中线，供左右侧识别和高速时的反向候选过滤."""
+        if not self._calib_pos:
+            return None
+        xs = [p[0] for p in self._calib_pos.values()]
+        return float(np.median(xs))
+
+    def _expected_side(self, jid, pred):
+        """返回该关节在当前帧应该出现的左右侧：left/right/both.
+
+        这里以身体中线分左右，避免高速时左/右反光点互相错配。"""
+        center_x = self._body_center_x()
+        if center_x is None or pred is None:
+            return None
+        return "left" if pred[0] < center_x else "right"
+
     def set_calibration(self, calib_pos, calib_radius=0.0, gray=None):
         """calib_pos: {jid_int: (x, y)}"""
         self._calib_pos = {int(j): (float(p[0]), float(p[1]))
-                           for j, p in calib_pos.items()}
+                          for j, p in calib_pos.items()}
         self.bones = {}
         for a, b in BONE_PAIRS:
             if a in calib_pos and b in calib_pos:
@@ -366,8 +383,11 @@ class MarkerAssociator:
         H, W = gray.shape[:2]
         se, k = self._structuring_element()
         pad = k // 2 + 1
-        floor = c.tophat_floor if c.use_tophat else 20
-        r_max = c.max_radius * 1.25    # 略放宽: 运动拖影会让半径变大
+        # 远距离 (约 1.6m 左右) 的反光点更暗、轮廓更小，固定阈值会被直接过滤。
+        # 因此在低参考半径（小目标/远处）时主动放宽阈值并扩大半径检出范围。
+        ref_r = max(2.0, self.r_ref if self.r_ref > 0 else c.min_radius)
+        floor = max(6, int(c.tophat_floor * (0.6 if ref_r <= 6.0 else 0.8)))
+        r_max = c.max_radius * (1.6 if ref_r <= 6.0 else 1.3)
         blobs = []
         for (x1, y1, x2, y2) in rects:
             X1, Y1 = max(0, x1 - pad), max(0, y1 - pad)
@@ -382,8 +402,8 @@ class MarkerAssociator:
             peak = int(img.max())
             if peak < floor:
                 continue
-            # 由高到低三级阈值: 高阈值先分出亮核, 低阈值补回偏暗的点
-            for frac in (0.5, 0.28, 0.14):
+            # 由高到低三级阈值: 高阈值先分出亮核, 低阈值补回偏暗的远距离点
+            for frac in (0.45, 0.22, 0.10):
                 thr = max(floor, int(peak * frac))
                 _, bw = cv2.threshold(img, thr, 255, cv2.THRESH_BINARY)
                 cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL,
@@ -530,6 +550,8 @@ class MarkerAssociator:
             limit = self._calib_limit(j)
             spd = float(np.hypot(vx, vy))
             lst = []
+            center_x = self._body_center_x()
+            side_hint = self._expected_side(j, (px, py))
             for bi, b in enumerate(blobs):
                 d = float(np.hypot(b.x - px, b.y - py))
                 if d > gate:
@@ -552,6 +574,13 @@ class MarkerAssociator:
                     if dot < 0:
                         dir_pen = 0.3 * min(1.5, -dot / (spd * d))
                         cost += dir_pen
+                # ── 左右侧强约束: 防止高速时把左侧候选误配到右侧/反之 ──
+                # 以身体中线为边界，错侧候选直接显著惩罚，避免“点位错乱跟不上轨迹”。
+                if side_hint is not None and center_x is not None:
+                    if side_hint == "left" and b.x > center_x + 5.0:
+                        cost += 3.0
+                    elif side_hint == "right" and b.x < center_x - 5.0:
+                        cost += 3.0
                 if cost < self.MISS_COST:
                     lst.append((cost, bi))
             lst.sort()
