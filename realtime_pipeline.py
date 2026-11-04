@@ -233,7 +233,7 @@ class ProcessThread(QThread):
                 res = self._fn(*item)
             except Exception:
                 now = time.perf_counter()
-                if now - self._last_err > 5.0:      # 限频打印, 避免刷屏
+                if now - self._last_err > 1.0:      # 限频打印, 避免刷屏
                     try:
                         traceback.print_exc()
                     except OSError:

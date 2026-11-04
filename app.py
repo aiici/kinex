@@ -38,16 +38,21 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QFormLayout, QGroupBox, QLabel, QPushButton,
     QSpinBox, QDoubleSpinBox, QCheckBox, QFileDialog, QSlider,
-    QFrame, QSizePolicy, QDialog, QListWidget, QDialogButtonBox
+    QFrame, QSizePolicy, QDialog, QListWidget, QDialogButtonBox,
+    QToolBar
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPoint
-from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QFont, QColor
+from PyQt6.QtGui import (
+    QImage, QPixmap, QMouseEvent, QFont, QColor, QAction)
 
 from vision import MarkerDetector, MarkerConfig, MarkerTracker
 from vision.circle_detection import find_circles_detailed, CircleCandidate
 from core.models import JointID
 from core.geometry import angle_2d
 from pose_analysis.tracking_engine import MotionPredictor, MarkerAssociator
+from pose_analysis.rider_model import RiderModel
+from pose_analysis.front_knee_view import render_front_knee, FRONT_W, FRONT_H
+from pose_analysis.layer_mask import apply_layer_mask
 from pose_analysis.pose_tracker import MediaPipeTracker
 from pose_analysis.metrics import MetricsCollector, METRIC_CN
 from utils.frozen_path import resource_path
@@ -266,10 +271,105 @@ QStatusBar {
     font-size: 10px;
     font-family: Consolas, monospace;
 }
+QStatusBar::item { border: none; }
+QStatusBar QLabel { color: #c8d6e5; background: transparent; }
+
+QMenuBar {
+    background: #0a1018;
+    color: #c8d6e5;
+    border-bottom: 1px solid #1a3a5c;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 2px 4px;
+}
+QMenuBar::item {
+    background: transparent;
+    padding: 4px 12px;
+    color: #c8d6e5;
+}
+QMenuBar::item:selected {
+    background: #142838;
+    color: #00f0ff;
+    border-bottom: 2px solid #00d4ff;
+}
+QMenuBar::item:disabled { color: #3a4a5a; }
+
+QMenu {
+    background: #0d1520;
+    border: 1px solid #1a3a5c;
+    color: #c8d6e5;
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    padding: 4px;
+}
+QMenu::item {
+    padding: 5px 26px 5px 16px;
+    background: transparent;
+}
+QMenu::item:selected {
+    background: #142838;
+    color: #00f0ff;
+    border-left: 2px solid #00d4ff;
+}
+QMenu::item:disabled { color: #3a4a5a; }
+QMenu::separator {
+    height: 1px;
+    background: #1a3a5c;
+    margin: 4px 8px;
+}
+
+QToolBar {
+    background: #0a1018;
+    border: none;
+    border-bottom: 1px solid #1a3a5c;
+    spacing: 4px;
+    padding: 3px 6px;
+}
+QToolBar::separator {
+    width: 1px;
+    background: #1a3a5c;
+    margin: 2px 6px;
+}
+QToolButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #142838, stop:1 #0a1828);
+    color: #00f0ff;
+    border: 1px solid #1a4a6c;
+    border-radius: 2px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: bold;
+    font-family: Consolas, monospace;
+}
+QToolButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #1a3a5c, stop:1 #142838);
+    border: 1px solid #00d4ff;
+    color: #ffffff;
+}
+QToolButton:disabled {
+    background: #0a1018;
+    color: #3a4a5a;
+    border: 1px solid #1a2a3a;
+}
+QToolButton:checked {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #00a8cc, stop:1 #007090);
+    color: #070b14;
+    border: 1px solid #00f0ff;
+}
 """
 
 DEFAULT_VIDEO = resource_path(
     "pose_analysis", "videos", "demo.mp4")
+
+# 追踪模式: mp = MediaPipe + 反光点精化 (原流程) / marker = 纯反光点追踪
+#           / hybrid = 反光点为主, 命中不足时 MediaPipe 救场
+# TRACK_MODE = os.environ.get("KINEX_TRACK_MODE", "mp").strip().lower()
+# DEBUG_TRACK = os.environ.get("KINEX_DEBUG", "0").strip() == "1"
+TRACK_MODE = "marker"      # 原来是 os.environ.get(...)
+DEBUG_TRACK = True
 
 
 # ==================== 配置 ====================
@@ -320,13 +420,20 @@ class AppConfig:
 # ==================== 核心逻辑 ====================
 
 class AngleSmoother:
-    """移动平均平滑"""
-    def __init__(self, win):
-        self._win = max(2, win)
-        self._buf = {n: deque(maxlen=self._win) for n in JOINT_NAMES}
+    """One-Euro 滤波: 低速强平滑, 角速度大时自动放开, 延迟远小于移动平均"""
+    def __init__(self, win, beta=0.02, d_cutoff=0.15):
+        self._win = max(2, win)                 # 保留属性, _apply_cfg_changes 在用
+        self._min_cut = 0.4 / self._win
+        self._beta = beta
+        self._d_cut = d_cutoff
+        self._st = {}
 
     def reset(self):
-        self._buf = {n: deque(maxlen=self._win) for n in JOINT_NAMES}
+        self._st = {}
+
+    @staticmethod
+    def _alpha(cutoff):
+        return 1.0 / (1.0 + 1.0 / (2.0 * np.pi * cutoff))
 
     def smooth(self, angles):
         out = {}
@@ -334,11 +441,19 @@ class AngleSmoother:
             if a is None:
                 out[n] = None
                 continue
-            self._buf[n].append(a)
-            buf = self._buf[n]
-            out[n] = sum(buf) / len(buf)
+            s = self._st.get(n)
+            if s is None:
+                self._st[n] = (a, 0.0)
+                out[n] = a
+                continue
+            x_prev, dx_prev = s
+            dx = a - x_prev
+            dx_hat = dx_prev + self._alpha(self._d_cut) * (dx - dx_prev)
+            cutoff = self._min_cut + self._beta * abs(dx_hat)
+            x_hat = x_prev + self._alpha(cutoff) * (a - x_prev)
+            self._st[n] = (x_hat, dx_hat)
+            out[n] = x_hat
         return out
-
 
 # MotionPredictor 已移至 tracking_engine.py (α-β 滤波器版)
 
@@ -403,6 +518,28 @@ def _in_range(name, ang, ranges):
         return True
     lo, hi = ranges[name]
     return lo <= ang <= hi
+
+
+SKEL_LOW = (255, 140, 0)     # BGR 蓝: 角度低于下限
+ANGLE_TRIPLES = {            # 画扇形用: (端点A, 顶点, 端点B)
+    "elbow": (JointID.WRIST, JointID.ELBOW, JointID.SHOULDER),
+    "shoulder": (JointID.ELBOW, JointID.SHOULDER, JointID.HIP),
+    "hip": (JointID.SHOULDER, JointID.HIP, JointID.KNEE),
+    "knee": (JointID.HIP, JointID.KNEE, JointID.ANKLE),
+}
+
+
+def angle_status(name, ang, ranges):
+    """'low' 低于下限 / 'ok' 正常 / 'high' 高于上限 (无角度视为 ok)"""
+    if ang is None:
+        return "ok"
+    lo, hi = ranges[name]
+    return "low" if ang < lo else ("high" if ang > hi else "ok")
+
+
+def status_color(name, ang, ranges):
+    return {"low": SKEL_LOW, "ok": HOLO_SKEL_OK,
+            "high": HOLO_SKEL_BAD}[angle_status(name, ang, ranges)]
 
 
 # ── HUD 底纹缓存 (扫描线+网格, 按分辨率缓存, 避免每帧重绘) ──
@@ -491,8 +628,7 @@ def draw_visual(frame, pixels, angles, ranges, missing=False, frame_idx=0):
 
     for a_id, b_id, jname in SEGMENTS:
         if a_id in pixels and b_id in pixels:
-            color = HOLO_SKEL_OK if _in_range(jname, angles.get(jname), ranges) \
-                else HOLO_SKEL_BAD
+            color = status_color(jname, angles.get(jname), ranges)
             pa, pb = tuple(pixels[a_id]), tuple(pixels[b_id])
             cv2.line(glow, pa, pb, color, 8)  # 外光晕
 
@@ -507,8 +643,7 @@ def draw_visual(frame, pixels, angles, ranges, missing=False, frame_idx=0):
     # ═══ 亮线 + 节点 (直接画在 vis 上, 无需 copy) ═══
     for a_id, b_id, jname in SEGMENTS:
         if a_id in pixels and b_id in pixels:
-            color = HOLO_SKEL_OK if _in_range(jname, angles.get(jname), ranges) \
-                else HOLO_SKEL_BAD
+            color = status_color(jname, angles.get(jname), ranges)
             pa, pb = tuple(pixels[a_id]), tuple(pixels[b_id])
             cv2.line(vis, pa, pb, color, 2)
             mx, my = (pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2
@@ -522,6 +657,32 @@ def draw_visual(frame, pixels, angles, ranges, missing=False, frame_idx=0):
         cv2.putText(vis, POINT_LABEL[jid], (pt[0] + 11, pt[1] - 9),
                     cv2.FONT_HERSHEY_DUPLEX, 0.45, HOLO_NODE, 1)
 
+    # ═══ 关节角度扇形 + 红绿蓝状态环 ═══
+    arc_layer = np.zeros_like(vis)
+    arcs = []
+    for jname, jid in ANGLE_LABELS:
+        ang = angles.get(jname)
+        if ang is None or jid not in pixels:
+            continue
+        col = status_color(jname, ang, ranges)
+        vx, vy = int(pixels[jid][0]), int(pixels[jid][1])
+        tri = ANGLE_TRIPLES.get(jname)
+        if tri and tri[0] in pixels and tri[2] in pixels:
+            a1 = math.degrees(math.atan2(pixels[tri[0]][1] - vy,
+                                         pixels[tri[0]][0] - vx))
+            a2 = math.degrees(math.atan2(pixels[tri[2]][1] - vy,
+                                         pixels[tri[2]][0] - vx))
+            d = (a2 - a1 + 180.0) % 360.0 - 180.0
+            start = a1 if d >= 0 else a1 + d
+            sweep = abs(d)
+            cv2.ellipse(arc_layer, (vx, vy), (26, 26), 0,
+                        start, start + sweep, col, -1)
+            arcs.append(((vx, vy), start, sweep, col))
+        cv2.circle(vis, (vx, vy), 12, col, 2)
+    cv2.addWeighted(arc_layer, 0.35, vis, 1.0, 0, vis)
+    for c0, st, sw, col in arcs:
+        cv2.ellipse(vis, c0, (26, 26), 0, st, st + sw, col, 2)
+
     # ═══ 角度数值 (带背景框) ═══
     for jname, jid in ANGLE_LABELS:
         if jid not in pixels:
@@ -530,7 +691,7 @@ def draw_visual(frame, pixels, angles, ranges, missing=False, frame_idx=0):
         if ang is None:
             continue
         x, y = int(pixels[jid][0]), int(pixels[jid][1])
-        color = HOLO_SKEL_OK if _in_range(jname, ang, ranges) else HOLO_SKEL_BAD
+        color = status_color(jname, ang, ranges)
         tx, ty = x + 11, y + 19
         cv2.rectangle(vis, (tx - 2, ty - 10), (tx + 28, ty + 2),
                       (0, 15, 25), -1)
@@ -553,75 +714,24 @@ def draw_visual(frame, pixels, angles, ranges, missing=False, frame_idx=0):
         if ang is not None:
             ratio = max(0, min(1, (ang - lo) / max(1, hi - lo)))
             fill_w = int(22 * ratio)
-            c = HOLO_GREEN_BGR if lo <= ang <= hi else HOLO_SKEL_BAD
+            c = status_color(jname, ang, ranges)
             cv2.rectangle(vis, (bar_x, by), (bar_x + fill_w, by + bar_h), c, -1)
         cv2.putText(vis, JOINT_CN[jname][0], (bar_x + 24, by + 12),
                     cv2.FONT_HERSHEY_DUPLEX, 0.35, (0, 120, 140), 1)
 
+    # ═══ 图例 ═══
+    for i, (txt, col) in enumerate((("LOW", SKEL_LOW),
+                                    ("OK", HOLO_SKEL_OK),
+                                    ("HIGH", HOLO_SKEL_BAD))):
+        x0, y0 = 12 + i * 62, h - 44
+        cv2.rectangle(vis, (x0, y0), (x0 + 10, y0 + 10), col, -1)
+        cv2.putText(vis, txt, (x0 + 14, y0 + 10),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.35, col, 1)
+
     return vis
 
 
-def auto_assign_ids(candidates):
-    """
-    自动标定: 按位置启发式将 8 个候选点分配到 JointID 1~8
-
-    策略 (侧视骑行姿态):
-        1. 按 x 中位数分成 左/右 两组
-        2. 右组(前侧, x大): 腕(1)/肘(2)/肩(3) — 按 y 排序
-        3. 左组(后侧, x小): 髋(4)/膝(5)/踝(6) + 脚跟(7)/趾骨(8)
-        4. 脚跟/趾骨: y 最大的两个, x 小=脚跟, x 大=趾骨
-        5. 如果分组不均匀则回退到纯 y 排序
-    """
-    if len(candidates) < 8:
-        return None
-    # 取最亮的 8 个
-    top = sorted(candidates, key=lambda c: -c.brightness)[:8]
-    if len(top) < 8:
-        return None
-
-    # 按 x 最大间隔分组 (比中位数更鲁棒)
-    xs_sorted = sorted(set(c.cx for c in top))
-    if len(xs_sorted) >= 2:
-        gaps = [(xs_sorted[i + 1] - xs_sorted[i],
-                 xs_sorted[i], xs_sorted[i + 1])
-                for i in range(len(xs_sorted) - 1)]
-        max_gap = max(gaps, key=lambda g: g[0])
-        x_boundary = (max_gap[1] + max_gap[2]) / 2.0
-    else:
-        x_boundary = xs_sorted[0] if xs_sorted else 0
-    # 右组按 y 降序: y最大→腕(1), y中间→肘(2), y最小→肩(3)
-    right = sorted([c for c in top if c.cx >= x_boundary], key=lambda c: -c.cy)
-    left = sorted([c for c in top if c.cx < x_boundary], key=lambda c: c.cy)
-
-    click_map = {}
-
-    # 右组(前侧) 3 个: 腕/肘/肩 (y 从大到小)
-    # 左组(后侧) 5 个: 髋/膝/踝 + 脚跟/趾骨
-    if len(right) == 3 and len(left) == 5:
-        click_map[CALIB_ORDER[0]] = (right[0].cx, right[0].cy)  # 腕
-        click_map[CALIB_ORDER[1]] = (right[1].cx, right[1].cy)  # 肘
-        click_map[CALIB_ORDER[2]] = (right[2].cx, right[2].cy)  # 肩
-        click_map[CALIB_ORDER[3]] = (left[0].cx, left[0].cy)    # 髋
-        click_map[CALIB_ORDER[4]] = (left[1].cx, left[1].cy)    # 膝
-        click_map[CALIB_ORDER[5]] = (left[2].cx, left[2].cy)    # 踝
-        # 最下方两个: x 小=脚跟, x 大=趾骨
-        foot = sorted(left[3:5], key=lambda c: c.cx)
-        click_map[CALIB_ORDER[6]] = (foot[0].cx, foot[0].cy)    # 脚跟
-        click_map[CALIB_ORDER[7]] = (foot[1].cx, foot[1].cy)    # 趾骨
-    else:
-        # 回退: 纯 y 排序
-        top.sort(key=lambda c: c.cy)
-        click_map[CALIB_ORDER[0]] = (top[0].cx, top[0].cy)  # 腕
-        click_map[CALIB_ORDER[1]] = (top[1].cx, top[1].cy)  # 肘
-        click_map[CALIB_ORDER[2]] = (top[2].cx, top[2].cy)  # 肩
-        click_map[CALIB_ORDER[3]] = (top[3].cx, top[3].cy)  # 髋
-        click_map[CALIB_ORDER[4]] = (top[4].cx, top[4].cy)  # 膝
-        click_map[CALIB_ORDER[5]] = (top[5].cx, top[5].cy)  # 踝
-        foot = sorted(top[6:8], key=lambda c: c.cx)
-        click_map[CALIB_ORDER[6]] = (foot[0].cx, foot[0].cy)  # 脚跟
-        click_map[CALIB_ORDER[7]] = (foot[1].cx, foot[1].cy)  # 趾骨
-
-    return click_map if len(click_map) == 8 else None
+from pose_analysis.auto_calib import auto_assign_ids, AUTO_INFO  # 朝向感知的自动标定
 
 
 # ==================== 视频显示 Label ====================
@@ -698,12 +808,16 @@ class PoseAnalysisGUI(QMainWindow):
         self._associator = MarkerAssociator(self._cfg)  # top-hat + 骨长约束匹配
         self._mp_tracker = MediaPipeTracker(self._cfg)  # MediaPipe AI 姿态追踪
         self._metrics = MetricsCollector()  # 实时指标采集
+        self._rider = RiderModel()   # 左右侧数据汇总 + 正面膝盖模型
         self._calib_radius = 0.0   # 标定时的参考半径
         self._calib_pos = {}       # 标定位置 {jid_int: (x, y)}
         self._lost = {}            # 连续丢失帧数 {jid_int: int}
         self._last_pixels = {}     # 上一帧像素坐标 (后备)
         self._first_candidates = []  # 首帧候选圆点 (辅助标定)
-        self._track_ts = 0.0       # 上次追踪时间戳 (计算 dt 用)
+        self._last_idx = None      # 上一处理帧的采集序号 (算 dt 用)
+        self._last_matched = set() # 本帧反光点真正命中的关节
+        self._weak_cnt = 0         # 连续命中不足的帧数
+        self._prev_small = None    # 相机去重用
         self._nominal_interval = 1.0 / 30.0  # 标称帧间隔 (秒)
 
         self._cap = None
@@ -737,9 +851,8 @@ class PoseAnalysisGUI(QMainWindow):
         layout = QHBoxLayout(central)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # 左侧参数面板
-        left = self._build_param_panel()
-        layout.addWidget(left)
+        # 顶部菜单栏 + 工具栏 (原左侧「控制台」迁至顶部, 释放视频横向空间)
+        self._build_menu_and_toolbars()
 
         # 中间视频 + 状态
         right = self._build_video_panel()
@@ -749,184 +862,182 @@ class PoseAnalysisGUI(QMainWindow):
         self._metrics_panel = self._build_metrics_panel()
         layout.addWidget(self._metrics_panel)
 
-    # ─── 左侧参数面板 ──────────────────────────────────
+    # ─── 顶部菜单栏 + 工具栏 ──────────────────────────────
 
-    def _build_param_panel(self):
-        """构建左侧参数面板 — 全息 HUD 风格"""
-        panel = QFrame()
-        panel.setFixedWidth(330)
-        panel.setStyleSheet(
-            f"QFrame{{background:{HOLO_PANEL};"
-            f"border:1px solid {HOLO_BORDER};}}")
-        v = QVBoxLayout(panel)
-        v.setContentsMargins(6, 6, 6, 6)
-        v.setSpacing(4)
+    @staticmethod
+    def _tb_label(text):
+        """工具栏内联标签 — 暗色小字, 紧贴控件"""
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"color:{HOLO_DIM}; font-size:10px;"
+            f"font-family:Consolas,monospace;"
+            f"background:transparent; padding:0 2px 0 6px;")
+        return lbl
 
-        # ─ 系统标题 + 副标题 ─
-        title = QLabel("◈ KINEX  控制台")
-        title.setStyleSheet(
-            f"color:{HOLO_CYAN}; font-size:15px; font-weight:bold;"
-            f"font-family:Consolas,'Courier New',monospace;"
-            f"background:transparent; border:none;")
-        v.addWidget(title)
-        subtitle = QLabel("  全息运动分析系统")
-        subtitle.setStyleSheet(
-            f"color:{HOLO_DIM}; font-size:9px;"
-            f"font-family:Consolas,monospace; background:transparent;")
-        v.addWidget(subtitle)
-        # 标题下发光线
-        sep = QFrame()
-        sep.setFixedHeight(2)
-        sep.setStyleSheet(
-            f"background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
-            f"stop:0 {HOLO_CYAN}, stop:0.7 {HOLO_BORDER}, stop:1 transparent);")
-        v.addWidget(sep)
+    def _build_menu_and_toolbars(self):
+        """构建顶部菜单栏 + 工具栏 — 原左侧「控制台」迁至顶部。
 
-        # ─ 视频源 ─
-        grp_src = QGroupBox("◈ 数据源")
-        gs = QHBoxLayout(grp_src)
-        self.btn_open = QPushButton("▶ 加载视频")
-        self.btn_open.clicked.connect(self._on_open_video)
-        gs.addWidget(self.btn_open)
-        self.btn_camera = QPushButton("◈ 连接相机")
-        self.btn_camera.clicked.connect(self._on_open_camera)
-        gs.addWidget(self.btn_camera)
-        v.addWidget(grp_src)
+        按钮控件转为 QAction 置入菜单栏 (数据源/播放/标定);
+        数值参数保留为可调控件, 置入上方工具栏 (检测参数/角度阈值/平滑)。
+        视频画面获得完整横向空间, 便于实时追踪显示。
+        """
+        # ── 菜单栏: 数据源 / 播放 / 标定 ──
+        mb = self.menuBar()
 
-        # ─ 播放控制 ─
-        grp_play = QGroupBox("◈ 播放")
-        gp = QHBoxLayout(grp_play)
-        self.btn_play = QPushButton("▶ 播放")
-        self.btn_play.clicked.connect(self._on_play_pause)
+        m_src = mb.addMenu("◈ 数据源")
+        self.btn_open = QAction("▶ 加载视频", self)
+        self.btn_open.triggered.connect(self._on_open_video)
+        m_src.addAction(self.btn_open)
+        self.btn_camera = QAction("◈ 连接相机", self)
+        self.btn_camera.triggered.connect(self._on_open_camera)
+        m_src.addAction(self.btn_camera)
+
+        m_play = mb.addMenu("◈ 播放")
+        self.btn_play = QAction("▶ 播放", self)
+        self.btn_play.triggered.connect(self._on_play_pause)
         self.btn_play.setEnabled(False)
-        gp.addWidget(self.btn_play)
-        self.btn_reset = QPushButton("↻ 重置")
-        self.btn_reset.clicked.connect(self._on_reset)
-        gp.addWidget(self.btn_reset)
-        v.addWidget(grp_play)
+        m_play.addAction(self.btn_play)
+        self.btn_reset = QAction("↻ 重置", self)
+        self.btn_reset.triggered.connect(self._on_reset)
+        m_play.addAction(self.btn_reset)
 
-        # ─ 标定 ─
-        grp_calib = QGroupBox("◈ 标定")
-        gc = QVBoxLayout(grp_calib)
-        self.btn_auto = QPushButton("⚡ 自动标定")
-        self.btn_auto.clicked.connect(self._on_auto_calib)
+        m_calib = mb.addMenu("◈ 标定")
+        self.btn_auto = QAction("⚡ 自动标定", self)
+        self.btn_auto.triggered.connect(self._on_auto_calib)
         self.btn_auto.setEnabled(False)
-        gc.addWidget(self.btn_auto)
-        self.btn_manual = QPushButton("✋ 手动标定")
+        m_calib.addAction(self.btn_auto)
+        self.btn_manual = QAction("✋ 手动标定", self)
         self.btn_manual.setCheckable(True)
-        self.btn_manual.clicked.connect(self._on_manual_mode)
+        self.btn_manual.triggered.connect(self._on_manual_mode)
         self.btn_manual.setEnabled(False)
-        gc.addWidget(self.btn_manual)
+        m_calib.addAction(self.btn_manual)
+
+        # ── 标定提示: 迁入状态栏 (原左侧面板) ──
         self.lbl_calib_hint = QLabel("—")
         self.lbl_calib_hint.setStyleSheet(
-            f"color:{HOLO_ORANGE}; font-size:11px; padding:2px;")
-        gc.addWidget(self.lbl_calib_hint)
-        v.addWidget(grp_calib)
+            f"color:{HOLO_ORANGE}; font-size:11px; padding:2px 8px;"
+            f"background:transparent;")
+        self.statusBar().addWidget(self.lbl_calib_hint, 1)
 
-        # ─ 检测参数 ─
-        grp_det = QGroupBox("◈ 检测参数")
-        gd = QFormLayout(grp_det)
+        # ── 工具栏: 检测参数 ──
+        tb = QToolBar("检测参数")
+        tb.setMovable(False)
+        tb.setObjectName("tb_detect")
+        self.addToolBar(tb)
+        tb.addWidget(self._tb_label("亮度阈值:"))
         self.sp_brightness = QSpinBox()
         self.sp_brightness.setRange(0, 255)
+        self.sp_brightness.setFixedWidth(58)
         self.sp_brightness.setValue(self._cfg.min_brightness)
         self.sp_brightness.valueChanged.connect(self._on_cfg_changed)
-        gd.addRow("亮度阈值:", self.sp_brightness)
-
+        tb.addWidget(self.sp_brightness)
         self.sl_brightness = QSlider(Qt.Orientation.Horizontal)
         self.sl_brightness.setRange(0, 255)
+        self.sl_brightness.setFixedWidth(120)
         self.sl_brightness.setValue(self._cfg.min_brightness)
         self.sl_brightness.valueChanged.connect(self.sp_brightness.setValue)
         self.sp_brightness.valueChanged.connect(self.sl_brightness.setValue)
-        gd.addRow("", self.sl_brightness)
-
+        tb.addWidget(self.sl_brightness)
+        tb.addSeparator()
+        tb.addWidget(self._tb_label("最小半径:"))
         self.sp_min_r = QSpinBox()
         self.sp_min_r.setRange(1, 50)
+        self.sp_min_r.setFixedWidth(54)
         self.sp_min_r.setValue(self._cfg.min_radius)
         self.sp_min_r.valueChanged.connect(self._on_cfg_changed)
-        gd.addRow("最小半径:", self.sp_min_r)
-
+        tb.addWidget(self.sp_min_r)
+        tb.addWidget(self._tb_label("最大半径:"))
         self.sp_max_r = QSpinBox()
         self.sp_max_r.setRange(2, 100)
+        self.sp_max_r.setFixedWidth(54)
         self.sp_max_r.setValue(self._cfg.max_radius)
         self.sp_max_r.valueChanged.connect(self._on_cfg_changed)
-        gd.addRow("最大半径:", self.sp_max_r)
-
+        tb.addWidget(self.sp_max_r)
+        tb.addWidget(self._tb_label("最小距离:"))
         self.sp_min_dist = QSpinBox()
         self.sp_min_dist.setRange(5, 200)
+        self.sp_min_dist.setFixedWidth(58)
         self.sp_min_dist.setValue(self._cfg.min_distance)
         self.sp_min_dist.valueChanged.connect(self._on_cfg_changed)
-        gd.addRow("最小距离:", self.sp_min_dist)
-
+        tb.addWidget(self.sp_min_dist)
+        tb.addWidget(self._tb_label("最小圆度:"))
         self.sp_circ = QDoubleSpinBox()
         self.sp_circ.setRange(0.0, 1.0)
         self.sp_circ.setSingleStep(0.05)
+        self.sp_circ.setFixedWidth(58)
         self.sp_circ.setValue(self._cfg.min_circularity)
         self.sp_circ.valueChanged.connect(self._on_cfg_changed)
-        gd.addRow("最小圆度:", self.sp_circ)
-
-        self.cb_auto = QCheckBox("自适应亮度 (候选不足自动降阈值)")
+        tb.addWidget(self.sp_circ)
+        tb.addSeparator()
+        self.cb_auto = QCheckBox("自适应亮度")
         self.cb_auto.setChecked(self._cfg.auto_brightness)
         self.cb_auto.stateChanged.connect(self._on_cfg_changed)
-        gd.addRow("", self.cb_auto)
-        v.addWidget(grp_det)
+        tb.addWidget(self.cb_auto)
 
-        # ─ 角度阈值 ─
-        grp_ang = QGroupBox("◈ 角度阈值 [最小, 最大]")
-        ga = QGridLayout(grp_ang)
-        ga.setSpacing(4)
+        # ── 工具栏: 角度阈值 [最小, 最大] ──
+        tb_ang = QToolBar("角度阈值")
+        tb_ang.setMovable(False)
+        tb_ang.setObjectName("tb_angle")
+        self.addToolBar(tb_ang)
         self._ang_spins = {}
-        for i, name in enumerate(JOINT_NAMES):
+        for name in JOINT_NAMES:
             lo, hi = self._cfg.ranges[name]
-            ga.addWidget(QLabel(JOINT_CN[name]), i, 0)
+            tb_ang.addWidget(self._tb_label(f"{JOINT_CN[name]}:"))
             sp_lo = QSpinBox()
             sp_lo.setRange(0, 180)
+            sp_lo.setFixedWidth(48)
             sp_lo.setValue(lo)
             sp_hi = QSpinBox()
             sp_hi.setRange(0, 180)
+            sp_hi.setFixedWidth(48)
             sp_hi.setValue(hi)
             sp_lo.valueChanged.connect(self._on_cfg_changed)
             sp_hi.valueChanged.connect(self._on_cfg_changed)
-            ga.addWidget(sp_lo, i, 1)
-            ga.addWidget(sp_hi, i, 2)
+            tb_ang.addWidget(sp_lo)
+            tb_ang.addWidget(sp_hi)
+            tb_ang.addSeparator()
             self._ang_spins[name] = (sp_lo, sp_hi)
-        v.addWidget(grp_ang)
 
-        # ─ 平滑 ─
-        grp_smooth = QGroupBox("◈ 平滑")
-        gsm = QFormLayout(grp_smooth)
+        # ── 工具栏: 平滑 ──
+        tb_sm = QToolBar("平滑")
+        tb_sm.setMovable(False)
+        tb_sm.setObjectName("tb_smooth")
+        self.addToolBar(tb_sm)
+        tb_sm.addWidget(self._tb_label("窗口:"))
         self.sp_smooth = QSpinBox()
         self.sp_smooth.setRange(1, 30)
+        self.sp_smooth.setFixedWidth(54)
         self.sp_smooth.setValue(self._cfg.smooth_window)
         self.sp_smooth.valueChanged.connect(self._on_cfg_changed)
-        gsm.addRow("窗口大小:", self.sp_smooth)
-
+        tb_sm.addWidget(self.sp_smooth)
+        tb_sm.addWidget(self._tb_label("最大位移:"))
         self.sp_jump = QSpinBox()
         self.sp_jump.setRange(10, 300)
+        self.sp_jump.setFixedWidth(58)
         self.sp_jump.setValue(int(self._cfg.max_jump))
         self.sp_jump.valueChanged.connect(self._on_cfg_changed)
-        gsm.addRow("最大位移:", self.sp_jump)
-
+        tb_sm.addWidget(self.sp_jump)
+        tb_sm.addWidget(self._tb_label("丢失容差:"))
         self.sp_lost = QSpinBox()
         self.sp_lost.setRange(1, 100)
+        self.sp_lost.setFixedWidth(54)
         self.sp_lost.setValue(self._cfg.max_lost_frames)
         self.sp_lost.valueChanged.connect(self._on_cfg_changed)
-        gsm.addRow("丢失容差:", self.sp_lost)
-
+        tb_sm.addWidget(self.sp_lost)
+        tb_sm.addWidget(self._tb_label("ROI半径:"))
         self.sp_roi = QSpinBox()
         self.sp_roi.setRange(20, 200)
+        self.sp_roi.setFixedWidth(58)
         self.sp_roi.setValue(self._cfg.roi_radius)
         self.sp_roi.valueChanged.connect(self._on_cfg_changed)
-        gsm.addRow("ROI半径:", self.sp_roi)
-
+        tb_sm.addWidget(self.sp_roi)
+        tb_sm.addWidget(self._tb_label("匹配距离:"))
         self.sp_max_move = QSpinBox()
         self.sp_max_move.setRange(10, 100)
+        self.sp_max_move.setFixedWidth(54)
         self.sp_max_move.setValue(int(self._cfg.track_max_move))
         self.sp_max_move.valueChanged.connect(self._on_cfg_changed)
-        gsm.addRow("匹配距离:", self.sp_max_move)
-        v.addWidget(grp_smooth)
-
-        v.addStretch()
-        return panel
+        tb_sm.addWidget(self.sp_max_move)
 
     # ─── 右侧视频面板 ──────────────────────────────────
 
@@ -976,9 +1087,17 @@ class PoseAnalysisGUI(QMainWindow):
         v.addWidget(hud_bar)
 
         # 视频画面
+        row = QHBoxLayout()
+        row.setSpacing(2)
         self.video_label = VideoLabel()
         self.video_label.clicked.connect(self._on_video_click)
-        v.addWidget(self.video_label, 1)
+        row.addWidget(self.video_label, 1)
+        self.front_label = VideoLabel()
+        self.front_label.setMinimumSize(FRONT_W, 300)
+        self.front_label.setFixedWidth(FRONT_W)
+        self.front_label.setText("◈ 正面膝盖 (模拟)\n\n标定后显示")
+        row.addWidget(self.front_label)
+        v.addLayout(row, 1)
 
         # ─ 底部状态条 (带 HUD 装饰) ─
         status_frame = QFrame()
@@ -1571,7 +1690,7 @@ class PoseAnalysisGUI(QMainWindow):
                 self._save_calib_pos(click_map)
                 self._init_tracker(click_map)
                 self.lbl_calib_hint.setText(
-                    "自动标定完成, 请播放后检查编号是否正确\n"
+                    "自动标定完成 [" + AUTO_INFO.get("label", "?") + "], 请播放后检查编号是否正确\n" +
                     "如编号不对请「重置标定」后用「手动标定」")
                 self.lbl_status.setText("标定完成, 点击「播放」开始")
             else:
@@ -1594,7 +1713,7 @@ class PoseAnalysisGUI(QMainWindow):
             self._save_calib_pos(click_map)
             self._init_tracker(click_map)
             self.lbl_calib_hint.setText(
-                "自动标定完成, 请播放后检查编号是否正确\n"
+                "自动标定完成 [" + AUTO_INFO.get("label", "?") + "], 请播放后检查编号是否正确\n" +
                 "如编号不对请「重置标定」后用「手动标定」")
             self.lbl_status.setText("标定完成, 点击「播放」开始")
         else:
@@ -1675,7 +1794,8 @@ class PoseAnalysisGUI(QMainWindow):
         """流水线启动时调用 (GUI 线程): 返回 (读帧函数, 节拍间隔秒, 是否背压)"""
         self._timer.display_box = (self.video_label.width(),
                                    self.video_label.height())
-        self._track_ts = 0.0          # 重置帧间隔计时
+        self._last_idx = None         # 重置帧序号 (dt 用采集序号之差)
+        self._prev_small = None
         if self._is_camera and self._camera_device is not None:
             self._cam_idx = self._frame_idx
             self._cam_reads = 0
@@ -1703,6 +1823,12 @@ class PoseAnalysisGUI(QMainWindow):
         frame, gray = self._get_camera_frames()
         if frame is None:
             return None
+        # 同一帧重复读取不计数, 否则 dt 会被虚高
+        small = cv2.resize(gray, (64, 48), interpolation=cv2.INTER_AREA)
+        if (self._prev_small is not None
+                and np.array_equal(small, self._prev_small)):
+            return None
+        self._prev_small = small
         self._cam_idx += 1
         return frame, gray, self._cam_idx
 
@@ -1750,28 +1876,58 @@ class PoseAnalysisGUI(QMainWindow):
         with self._state_lock:
             if self._cfg_dirty:
                 self._apply_cfg_changes()
-            # 计算实际帧间隔 dt (相对于标称帧间隔的倍数, 1.0=正常)
-            now_ts = time.perf_counter()
-            if self._track_ts > 0 and self._nominal_interval > 0:
-                dt = (now_ts - self._track_ts) / self._nominal_interval
-                dt = float(np.clip(dt, 0.25, 3.0))
+            # dt = 采集帧序号之差 (视频逐帧=1, 相机丢帧=实际间隔), 不用墙钟
+            if self._last_idx is not None and idx > self._last_idx:
+                dt = float(np.clip(idx - self._last_idx, 1, 4))
             else:
                 dt = 1.0
-            self._track_ts = now_ts
+                if self._last_idx is not None and self._calibrated:
+                    # 视频循环回绕: 人物回到起始姿态, 重置追踪状态
+                    self._motion.seed(self._calib_pos)
+                    self._lost = {j: 0 for j in self._calib_pos}
+                    self._last_pixels = dict(self._calib_pos)
+                    self._smoother.reset()
+            self._last_idx = idx
             if self._calibrated:
-                # MediaPipe AI 姿态追踪 + 反光点精化; 失败回退到反光点追踪
-                pixels, _src = self._mp_tracker.track_with_refine(frame, gray)
-                if not pixels:
+                if TRACK_MODE == "mp":
+                    # 原流程: MediaPipe + 反光点精化, 失败才用反光点追踪
+                    pixels, _src = self._mp_tracker.track_with_refine(frame, gray)
+                    if not pixels:
+                        pixels = self._fallback_track(gray, dt)
+                    self._last_matched = {int(j) for j, s in _src.items()
+                                          if s == 'marker'}
+                else:
                     pixels = self._fallback_track(gray, dt)
-                detected = len(pixels)
+                n_hit = len(self._last_matched)
+                self._weak_cnt = self._weak_cnt + 1 if n_hit < 6 else 0
+                # 连续 3 帧命中不足 6 个才请 MediaPipe 救场, 且只补未命中的关节
+                if TRACK_MODE == "hybrid" and self._weak_cnt >= 3:
+                    mp_pos = self._mp_tracker.track(frame)   # 只取粗位置
+                    for j, p in (mp_pos or {}).items():
+                        j = int(j)
+                        if j in self._last_matched:
+                            continue
+                        c0 = self._calib_pos.get(j)
+                        if c0 is not None and np.hypot(
+                                p[0] - c0[0], p[1] - c0[1]) \
+                                > self._associator._calib_limit(j):
+                            continue
+                        self._motion.reseed(j, p[0], p[1])
+                        self._lost[j] = 3
+                        pixels[j] = (int(p[0]), int(p[1]))
+                detected = len(self._last_matched)
                 self._last_pixels = pixels
             else:
-                # 标定阶段: 全局检测 + tracker.update
                 candidates = self._detect_adaptive(gray)
                 pixels = self._tracker.update(candidates)
                 detected = len(candidates)
-            missing = len(pixels) < 8
+            if self._calibrated:
+                missing = len(self._last_matched) < 6
+            else:
+                missing = len(pixels) < 8
             angles = self._smoother.smooth(compute_angles(pixels))
+            if self._calibrated:
+                self._rider.push(pixels, idx * self._nominal_interval)
             if self._calibrated:
                 self._metrics.update(pixels, angles)
                 now = time.perf_counter()
@@ -1782,22 +1938,50 @@ class PoseAnalysisGUI(QMainWindow):
         t1 = time.perf_counter()
 
         h, w = frame.shape[:2]
-        vis = draw_visual(frame, pixels, angles, ranges,
+        vis = draw_visual(apply_layer_mask(frame), pixels, angles, ranges,
                           missing=missing, frame_idx=idx)
+        if DEBUG_TRACK:
+            self._draw_debug(vis, pixels)
         bw, bh = self._timer.display_box
         image = to_display_bgra(vis, bw, bh)
+        front = render_front_knee(
+            self._rider.front_state(idx * self._nominal_interval),
+            (FRONT_W, FRONT_H))
         t2 = time.perf_counter()
         return {
-            "image": image, "src_w": w, "src_h": h, "frame_idx": idx,
+            "image": image, "front": front, "src_w": w, "src_h": h, "frame_idx": idx,
             "detected": detected, "tracked": len(pixels), "angles": angles,
             "metrics": metrics_disp,
             "track_ms": (t1 - t0) * 1000.0, "draw_ms": (t2 - t1) * 1000.0,
         }
 
+    def _draw_debug(self, vis, pixels):
+        """调试叠加: 灰圈=候选反光点 黄十字+细圆=预测位置与搜索门
+        绿圈=本帧真正命中 红圈=外推/MediaPipe 位置"""
+        d = self._associator.debug or {}
+        for (x, y, r) in d.get("blobs", []):
+            cv2.circle(vis, (int(x), int(y)), max(2, int(r)), (160, 160, 160), 1)
+        gates = d.get("gate", {})
+        for j, (px, py) in d.get("pred", {}).items():
+            p = (int(px), int(py))
+            cv2.drawMarker(vis, p, (0, 255, 255), cv2.MARKER_CROSS, 10, 1)
+            cv2.circle(vis, p, int(gates.get(j, 0)), (0, 120, 120), 1)
+            cv2.putText(vis, str(j), (p[0] + 6, p[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+        for j, (x, y) in pixels.items():
+            hit = int(j) in self._last_matched
+            cv2.circle(vis, (int(x), int(y)), 7,
+                       (0, 255, 0) if hit else (0, 0, 255), 2)
+        cv2.putText(vis, "MODE:%s HIT:%d/8 BLOBS:%d" % (
+            TRACK_MODE, len(self._last_matched), len(d.get("blobs", []))),
+            (12, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
     def _on_pipeline_result(self, r):
         """[GUI 线程] 贴图 + 低频刷新文字, 不做任何重活"""
         self._frame_idx = r["frame_idx"]
         self.video_label.show_array(r["image"], r["src_w"], r["src_h"])
+        if r.get("front") is not None:
+            self.front_label.show_array(r["front"])
         if r["metrics"] is not None:
             self._update_metrics_display(r["metrics"])
         now = time.perf_counter()
@@ -1831,13 +2015,18 @@ class PoseAnalysisGUI(QMainWindow):
         self._update_metrics_display(self._metrics.get_display())
         self._lost = {jid: 0 for jid in calib_pos}
         self._last_pixels = dict(calib_pos)
+        self._rider.reset()
+        self._rider.set_calibration(calib_pos)
+        self._last_matched = set()
+        self._weak_cnt = 0
+        self._last_idx = None
+        self._smoother.reset()
 
     def _fallback_track(self, gray, dt=1.0):
-        """MediaPipe 失败时的反光点追踪后备"""
+        """反光点追踪 (主路径): 关联 → 滤波更新 → 丢失时外推/回到标定点重捕获"""
         tracked = list(self._calib_pos.keys())
         matched = self._associator.associate(
             gray, self._motion, tracked, self._last_pixels, self._lost, dt)
-        # 只接受离标定不太远的匹配
         safe = {}
         for jid_int, (x, y) in matched.items():
             cx, cy = self._calib_pos.get(jid_int, (None, None))
@@ -1846,23 +2035,21 @@ class PoseAnalysisGUI(QMainWindow):
                 if np.hypot(x - cx, y - cy) > lim:
                     continue
             safe[int(jid_int)] = (x, y)
+        self._last_matched = set(safe.keys())
         self._motion.update(safe, dt)
         pixels = {}
         for jid_int in tracked:
-            if jid_int in matched:
-                x, y = matched[jid_int]
+            if jid_int in safe:
+                x, y = safe[jid_int]
                 pixels[jid_int] = (int(x), int(y))
                 self._lost[jid_int] = 0
             else:
                 self._lost[jid_int] = self._lost.get(jid_int, 0) + 1
-                # 使用 MotionPredictor 内部的 lost_age 判断是否需要 reseed
-                # (lost_age 包含被异常门拒绝的帧, 比外部 _lost 更准确)
-                internal_lost = self._motion.lost_age(jid_int)
-                if internal_lost > 8 or self._lost[jid_int] > 5:
+                if self._motion.lost_age(jid_int) > 8 or self._lost[jid_int] > 5:
                     cx, cy = self._calib_pos.get(jid_int, (None, None))
                     if cx is not None:
                         self._motion.reseed(jid_int, cx, cy)
-                        self._lost[jid_int] = 0
+                        self._lost[jid_int] = 4     # 不清零, 让搜索门保持放大
                 pred = self._motion.predict(jid_int, dt)
                 if pred is not None:
                     cx, cy = self._calib_pos.get(jid_int, (None, None))

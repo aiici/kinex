@@ -1,13 +1,10 @@
-###########------------pose_tracker.py
-"""MediaPipe Pose 追踪引擎 — AI 人体姿态估计 + 反光点精化
+"""MediaPipe Pose 追踪引擎 — 修复版
 
-流程:
-  1. MediaPipe Pose Landmarker 检测人体 33 个关键点
-  2. 判断左/右侧 (侧面拍摄, 选 visibility 高的一侧)
-  3. 映射到骑行的 8 个关节
-  4. 在 MediaPipe 位置附近用 top-hat 搜索反光点 (精化)
-  5. 找到反光点 → 用反光点位置 (精确)
-     找不到 → 用 MediaPipe 位置 (稳定后备)
+改动:
+  · 骨长不再硬编码, 标定时按真实标定点计算 (self._bones)
+  · 骨长惩罚改为分级容差 (短骨蹬踏时 2D 投影变化大, 不再被过度惩罚)
+  · 没有标定骨长时, 不做骨长优化, 直接用候选最近者, 不会用错误的常数
+  · 推荐用法: app.py 里反光点追踪做主路径, 只调用 track() 取粗位置救场
 """
 import os
 import sys
@@ -17,16 +14,16 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
-# MediaPipe 33 关键点 → 骑行 8 关节映射
 SIDE_L = {11: 3, 13: 2, 15: 1, 23: 4, 25: 5, 27: 6, 29: 7, 31: 8}
 SIDE_R = {12: 3, 14: 2, 16: 1, 24: 4, 26: 5, 28: 6, 30: 7, 32: 8}
 
-# 模型文件路径 (兼容 PyInstaller frozen 模式)
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 from utils.frozen_path import resource_path
 _MODEL_PATH = resource_path('pose_analysis', 'pose_landmarker_full.task')
+
+_BONE_PAIRS = ((4, 5), (5, 6), (6, 7), (6, 8), (7, 8))
 
 
 class MediaPipeTracker:
@@ -35,7 +32,8 @@ class MediaPipeTracker:
     def __init__(self, cfg):
         self.cfg = cfg
         self._calib_pos = {}
-        self._side = None       # 'L' / 'R' (首帧确定后固定)
+        self._bones = {}
+        self._side = None
         self._frame_idx = 0
         self._detector = None
         self._init_detector()
@@ -53,77 +51,66 @@ class MediaPipeTracker:
 
     def reset(self):
         self._calib_pos = {}
+        self._bones = {}
         self._side = None
-        # 不重置 _frame_idx: MediaPipe detect_for_video 要求时间戳单调递增,
-        # 重置会导致后续时间戳 < 上次时间戳 → ValueError
+        # 不重置 _frame_idx: detect_for_video 要求时间戳单调递增
 
     def calibrate(self, calib_pos):
-        """标定: 保存反光点位置 {jid_int: (x, y)}"""
+        """标定: 保存反光点位置并计算真实骨长"""
         self._calib_pos = {int(j): (float(p[0]), float(p[1]))
                            for j, p in calib_pos.items()}
         self._side = None
-        # 不重置 _frame_idx: MediaPipe detect_for_video 要求时间戳单调递增
+        self._bones = {}
+        for a, b in _BONE_PAIRS:
+            if a in self._calib_pos and b in self._calib_pos:
+                pa, pb = self._calib_pos[a], self._calib_pos[b]
+                self._bones[(a, b)] = float(np.hypot(pa[0] - pb[0], pa[1] - pb[1]))
 
     @property
     def calibrated(self):
         return bool(self._calib_pos)
 
     def track(self, frame_bgr):
-        """追踪一帧, 返回 {jid_int: (x, y)} (像素坐标)
-
-        frame_bgr: 缩放后的 BGR 帧 (NW x NH)
-        """
+        """追踪一帧, 返回 {jid_int: (x, y)} (像素坐标, 仅 MediaPipe 粗位置)"""
         if self._detector is None:
             return {}
         h, w = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        ts = self._frame_idx * 33  # 毫秒时间戳 (30fps → 33ms/frame)
+        ts = self._frame_idx * 33
         self._frame_idx += 1
         result = self._detector.detect_for_video(mp_img, ts)
         if not result.pose_landmarks:
             return {}
         lm = result.pose_landmarks[0]
 
-        # 判断左/右侧 (首帧确定, 后续固定)
         if self._side is None:
             vis_l = sum(lm[i].visibility for i in SIDE_L)
             vis_r = sum(lm[i].visibility for i in SIDE_R)
             self._side = 'L' if vis_l >= vis_r else 'R'
         side = SIDE_L if self._side == 'L' else SIDE_R
 
-        # 映射到 8 关节
         mp_pos = {}
         for mpi, jid in side.items():
-            x = lm[mpi].x * w
-            y = lm[mpi].y * NH_factor(lm[mpi], w, h)
-            mp_pos[int(jid)] = (x, y)
+            mp_pos[int(jid)] = (lm[mpi].x * w, lm[mpi].y * h)
         return mp_pos
 
     def track_with_refine(self, frame_bgr, gray):
-        """追踪 + 反光点精化 (全局贪心匹配 + 足部骨骼约束修正)
-
-        返回 (pixels, source):
-          pixels: {jid_int: (x, y)}
-          source: {jid_int: 'marker' / 'mp'}
-        """
+        """追踪 + 反光点精化. 返回 (pixels, source)"""
         mp_pos = self.track(frame_bgr)
         if not mp_pos:
             return {}, {}
 
         se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
-        # 1. 每个关节收集所有候选反光点
-        joint_cands = {}  # {jid: [(x, y, d), ...]}
-        all_cands = []    # [(d, jid, x, y), ...]
+        joint_cands = {}
+        all_cands = []
         for jid, (px, py) in mp_pos.items():
-            # 4号点(髋) MediaPipe偏差大(~24px), 用更大搜索窗口
             r = 8.0 if jid == 4 else 6.0
             cands = self._find_markers_near(gray, px, py, r, se)
             joint_cands[jid] = cands
             for (mx, my, d) in cands:
                 all_cands.append((d, int(jid), mx, my))
 
-        # 2. 全局贪心: 按距离升序, 逐个分配
         all_cands.sort()
         used_markers = set()
         used_joints = set()
@@ -140,54 +127,45 @@ class MediaPipeTracker:
             used_joints.add(jid)
             used_markers.add(key)
 
-        # 3a. 足部三关节(6,7,8)骨骼约束最优分配
-        if all(jid in mp_pos for jid in (6, 7, 8)):
-            pixels, source = self._optimize_foot(
-                pixels, source, joint_cands, mp_pos)
+        if self._bones:
+            if all(jid in mp_pos for jid in (6, 7, 8)):
+                pixels, source = self._optimize_foot(
+                    pixels, source, joint_cands, mp_pos)
+            if 5 in mp_pos and 6 in pixels:
+                pixels, source = self._optimize_chain(
+                    5, 6, pixels, source, joint_cands, mp_pos)
+            if 4 in mp_pos and 5 in pixels:
+                pixels, source = self._optimize_chain(
+                    4, 5, pixels, source, joint_cands, mp_pos)
 
-        # 3b. 膝关节(5)骨骼约束: 在6确定后, 选5-6距离最接近标定的候选
-        if 5 in mp_pos and 6 in pixels:
-            pixels, source = self._optimize_knee(
-                pixels, source, joint_cands, mp_pos)
-
-        # 3c. 髋关节(4)骨骼约束: 在5确定后, 选4-5距离最接近标定的候选
-        if 4 in mp_pos and 5 in pixels:
-            pixels, source = self._optimize_hip(
-                pixels, source, joint_cands, mp_pos)
-
-        # 4. 没匹配到反光点的关节用 MediaPipe 位置
         for jid, (px, py) in mp_pos.items():
             if jid not in pixels:
                 pixels[jid] = (int(px), int(py))
                 source[jid] = 'mp'
         return pixels, source
 
-    # 足部骨骼长度 (px)
-    _FOOT_BONE = {(6, 7): 25.0, (6, 8): 53.0, (7, 8): 53.0}
+    @staticmethod
+    def _bone_cost(d, L):
+        """分级容差的骨长惩罚 (与 MarkerAssociator 一致), 封顶 9"""
+        tol = 0.35 * L + 12.0 if L <= 60 else 0.15 * L + 2.0
+        return min((abs(d - L) / tol) ** 2, 9.0)
+
+    @staticmethod
+    def _cand_points(jid, joint_cands, mp_pos):
+        c = []
+        for (mx, my, _d) in joint_cands.get(jid, [])[:5]:
+            pt = (int(mx), int(my))
+            if pt not in c:
+                c.append(pt)
+        if not c:
+            c.append((int(mp_pos[jid][0]), int(mp_pos[jid][1])))
+        return c
 
     def _optimize_foot(self, pixels, source, joint_cands, mp_pos):
-        """对 6/7/8 做骨骼约束最优分配
-
-        枚举所有候选组合 (含 MediaPipe 位置), 代价 = 骨骼偏差*3 + MP距离*1。
-        """
-        # 收集候选: 只用反光点候选 (不含 MediaPipe 位置, 避免 mp_cost=0 干扰)
-        cands = {}
-        for jid in (6, 7, 8):
-            c = []
-            if jid in joint_cands:
-                for (mx, my, _d) in joint_cands[jid][:5]:
-                    pt = (int(mx), int(my))
-                    if pt not in c:
-                        c.append(pt)
-            if not c:  # 没有反光点候选时, 用 MediaPipe 位置兜底
-                c.append((int(mp_pos[jid][0]), int(mp_pos[jid][1])))
-            cands[jid] = c
-
-        # 枚举所有 3 元组
-        mp_pts = {jid: (int(mp_pos[jid][0]), int(mp_pos[jid][1]))
-                  for jid in (6, 7, 8)}
-        best_cost = 1e9
-        best = None
+        """6/7/8 骨长约束最优分配; 代价 = 0.5*骨长 + MediaPipe 距离/30"""
+        cands = {j: self._cand_points(j, joint_cands, mp_pos) for j in (6, 7, 8)}
+        mp_pts = {j: (int(mp_pos[j][0]), int(mp_pos[j][1])) for j in (6, 7, 8)}
+        best_cost, best = 1e9, None
         for p6 in cands[6]:
             for p7 in cands[7]:
                 if p7 == p6:
@@ -196,102 +174,44 @@ class MediaPipeTracker:
                     if p8 == p6 or p8 == p7:
                         continue
                     assign = {6: p6, 7: p7, 8: p8}
-                    # 骨骼长度偏差
                     bone_cost = 0.0
-                    for (a, b), L in self._FOOT_BONE.items():
-                        pa, pb = assign[a], assign[b]
-                        d = np.hypot(pa[0] - pb[0], pa[1] - pb[1])
-                        bone_cost += abs(d - L) / L
-                    # 到 MediaPipe 位置的距离 (防止关节间互换)
-                    mp_cost = 0.0
-                    for jid, pt in assign.items():
-                        mp_cost += np.hypot(pt[0] - mp_pts[jid][0],
-                                            pt[1] - mp_pts[jid][1]) / 30.0
-                    cost = bone_cost * 3.0 + mp_cost
+                    for (a, b), L in self._bones.items():
+                        if a in assign and b in assign:
+                            pa, pb = assign[a], assign[b]
+                            bone_cost += self._bone_cost(
+                                np.hypot(pa[0] - pb[0], pa[1] - pb[1]), L)
+                    mp_cost = sum(
+                        np.hypot(pt[0] - mp_pts[j][0], pt[1] - mp_pts[j][1]) / 30.0
+                        for j, pt in assign.items())
+                    cost = 0.5 * bone_cost + mp_cost
                     if cost < best_cost:
-                        best_cost = cost
-                        best = assign
-
+                        best_cost, best = cost, assign
         if best is not None:
-            for jid in (6, 7, 8):
-                pt = best[jid]
-                mp_pt = (int(mp_pos[jid][0]), int(mp_pos[jid][1]))
-                pixels[jid] = pt
-                source[jid] = 'mp' if pt == mp_pt else 'marker'
+            for j in (6, 7, 8):
+                pixels[j] = best[j]
+                source[j] = 'mp' if best[j] == mp_pts[j] else 'marker'
         return pixels, source
 
-    def _optimize_knee(self, pixels, source, joint_cands, mp_pos):
-        """对 5 做骨骼约束: 5-6 距离 ≈ 116px
-
-        在 6 确定后, 选 5 的候选使 5-6 距离最接近标定值。
-        """
-        p6 = pixels[6]
-        L56 = 116.0
-        mp_pt = (int(mp_pos[5][0]), int(mp_pos[5][1]))
-
-        # 收集候选: 只用反光点候选 (不含 MediaPipe 位置)
-        cands = []
-        if 5 in joint_cands:
-            for (mx, my, _d) in joint_cands[5][:5]:
-                pt = (int(mx), int(my))
-                if pt not in cands:
-                    cands.append(pt)
-        if not cands:  # 没有反光点候选时, 用 MediaPipe 位置兜底
-            cands.append(mp_pt)
-
-        best_cost = 1e9
-        best = None
-        for pt in cands:
-            d = np.hypot(pt[0] - p6[0], pt[1] - p6[1])
-            bone_cost = abs(d - L56) / L56
-            mp_cost = np.hypot(pt[0] - mp_pt[0], pt[1] - mp_pt[1]) / 30.0
-            cost = bone_cost * 3.0 + mp_cost
+    def _optimize_chain(self, jid, anchor, pixels, source, joint_cands, mp_pos):
+        """膝(5, 锚点6) / 髋(4, 锚点5): 选 jid-anchor 距离最接近标定骨长的候选"""
+        L = self._bones.get((jid, anchor))
+        if L is None:
+            return pixels, source
+        pa = pixels[anchor]
+        mp_pt = (int(mp_pos[jid][0]), int(mp_pos[jid][1]))
+        best_cost, best = 1e9, None
+        for pt in self._cand_points(jid, joint_cands, mp_pos):
+            d = np.hypot(pt[0] - pa[0], pt[1] - pa[1])
+            cost = (0.5 * self._bone_cost(d, L)
+                    + np.hypot(pt[0] - mp_pt[0], pt[1] - mp_pt[1]) / 30.0)
             if cost < best_cost:
-                best_cost = cost
-                best = pt
-
+                best_cost, best = cost, pt
         if best is not None:
-            pixels[5] = best
-            source[5] = 'mp' if best == mp_pt else 'marker'
-        return pixels, source
-
-    def _optimize_hip(self, pixels, source, joint_cands, mp_pos):
-        """对 4 做骨骼约束: 4-5 距离 ≈ 114px
-
-        在 5 确定后, 选 4 的候选使 4-5 距离最接近标定值。
-        """
-        p5 = pixels[5]
-        L45 = 114.0
-        mp_pt = (int(mp_pos[4][0]), int(mp_pos[4][1]))
-
-        # 收集候选: 只用反光点候选 (不含 MediaPipe 位置)
-        cands = []
-        if 4 in joint_cands:
-            for (mx, my, _d) in joint_cands[4][:5]:
-                pt = (int(mx), int(my))
-                if pt not in cands:
-                    cands.append(pt)
-        if not cands:  # 没有反光点候选时, 用 MediaPipe 位置兜底
-            cands.append(mp_pt)
-
-        best_cost = 1e9
-        best = None
-        for pt in cands:
-            d = np.hypot(pt[0] - p5[0], pt[1] - p5[1])
-            bone_cost = abs(d - L45) / L45
-            mp_cost = np.hypot(pt[0] - mp_pt[0], pt[1] - mp_pt[1]) / 30.0
-            cost = bone_cost * 3.0 + mp_cost
-            if cost < best_cost:
-                best_cost = cost
-                best = pt
-
-        if best is not None:
-            pixels[4] = best
-            source[4] = 'mp' if best == mp_pt else 'marker'
+            pixels[jid] = best
+            source[jid] = 'mp' if best == mp_pt else 'marker'
         return pixels, source
 
     def _find_markers_near(self, gray, cx, cy, r_ref, se):
-        """在 (cx, cy) 附近搜索反光点, 返回 [(x, y, 距离), ...] (按距离升序)"""
         H, W = gray.shape[:2]
         win = int(max(30, r_ref * 5))
         x1, y1 = max(0, int(cx - win)), max(0, int(cy - win))
@@ -315,13 +235,8 @@ class MediaPipeTracker:
             if not (2.0 <= lr <= 25):
                 continue
             d = np.hypot(lx - ox, ly - oy)
-            if d > win:  # 超出搜索半径
+            if d > win:
                 continue
             cands.append((lx + x1, ly + y1, d))
         cands.sort(key=lambda c: c[2])
         return cands
-
-
-def NH_factor(lm, w, h):
-    """MediaPipe 的 y 坐标已经是归一化的, 直接乘 h"""
-    return h
