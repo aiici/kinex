@@ -813,6 +813,7 @@ class PoseAnalysisGUI(QMainWindow):
         self._rider = RiderModel()   # 左右侧数据汇总 + 正面膝盖模型
         self._calib_radius = 0.0   # 标定时的参考半径
         self._calib_pos = {}       # 标定位置 {jid_int: (x, y)}
+        self._facing_sign = 1     # 朝向符号 +1朝右/-1朝左 (水平偏移量方向校正)
         self._lost = {}            # 连续丢失帧数 {jid_int: int}
         self._last_pixels = {}     # 上一帧像素坐标 (后备)
         self._first_candidates = []  # 首帧候选圆点 (辅助标定)
@@ -1139,11 +1140,11 @@ class PoseAnalysisGUI(QMainWindow):
         ('foot_knee_offset',1,1, 1, 1),
         ('hip_h_disp',    1, 1, 1, 1),
         ('hip_v_disp',    1, 1, 1, 1),
-        ('knee_lateral', 1, 1, 1, 0),
-        ('shoulder_lateral', 1, 1, 1, 0),
-        ('hip_lateral', 1, 1, 1, 0),
-        ('ankle_range', 1, 1, 1, 0),
-        ('hip_closed',    1, 0, 1, 0),
+        ('knee_lateral', 1, 1, 1, 1),
+        ('shoulder_lateral', 1, 1, 1, 1),
+        ('hip_lateral', 1, 1, 1, 1),
+        ('ankle_range', 1, 1, 1, 1),
+        ('hip_closed',    1, 1, 1, 1),
     ]
 
     def _build_metrics_panel(self):
@@ -1303,7 +1304,7 @@ class PoseAnalysisGUI(QMainWindow):
     def _on_reset_metrics(self):
         """重置指标统计 (流水线运行中与处理线程互斥)"""
         with self._state_lock:
-            self._metrics.reset(self._calib_pos)
+            self._metrics.reset(self._calib_pos, self._facing_sign)
             disp = self._metrics.get_display()
         self._update_metrics_display(disp)
 
@@ -2019,7 +2020,7 @@ class PoseAnalysisGUI(QMainWindow):
         self._associator.set_calibration(calib_pos, self._calib_radius, gray)
         self._motion.seed(calib_pos)
         self._mp_tracker.calibrate(calib_pos)
-        self._metrics.reset(calib_pos)  # 重置指标采集
+        self._metrics.reset(calib_pos, self._facing_sign)  # 重置指标采集
         self._update_metrics_display(self._metrics.get_display())
         self._lost = {jid: 0 for jid in calib_pos}
         self._last_pixels = dict(calib_pos)
@@ -2071,6 +2072,12 @@ class PoseAnalysisGUI(QMainWindow):
     def _save_calib_pos(self, click_map):
         """保存标定位置和下肢骨骼长度"""
         self._calib_pos = {int(jid): (x, y) for jid, (x, y) in click_map.items()}
+        # 朝向符号: 趾骨(8)在脚跟(7)前方 → +1 朝右 / -1 朝左
+        #   使水平偏移/偏摆量符号统一为"正=向前", 与画面左右朝向无关
+        heel = self._calib_pos.get(7)
+        toe = self._calib_pos.get(8)
+        if heel and toe:
+            self._facing_sign = 1 if toe[0] > heel[0] else -1
         self._calib_bones = {}
         # 下肢骨骼链: 髋-膝, 膝-踝, 踝-脚跟, 踝-趾骨, 脚跟-趾骨
         for a, b in [(4, 5), (5, 6), (6, 7), (6, 8), (7, 8)]:
@@ -2445,15 +2452,18 @@ class PoseAnalysisGUI(QMainWindow):
         """相机模式: 获取帧 (优先红外, 反光点可见)
 
         Returns: (bgr, gray) 或 (None, None)
+        水平镜像: Kinect 原始画面与人体左右相反, 翻转后画面/坐标/偏移方向一致。
         """
         if self._camera_device is None:
             return None, None
         ir = self._camera_device.get_ir_frame()
         if ir is not None and ir.size > 0:
+            ir = cv2.flip(ir, 1)        # 水平镜像, 校正左右反向
             return self._ir_to_bgr_gray(ir)
         # 回退彩色帧
         color = self._camera_device.get_color_frame()
         if color is not None:
+            color = cv2.flip(color, 1)  # 水平镜像
             color = self._resize_frame(color)
             return color, self._to_gray(color)
         return None, None

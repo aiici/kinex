@@ -36,21 +36,23 @@ METRIC_CN = {
 TRACK_STATS = [
     'knee_angle', 'ankle_angle', 'shoulder_angle', 'elbow_angle',
     'back_angle', 'foot_knee_offset', 'hip_h_disp', 'hip_v_disp',
+    'hip_closed',
 ]
 
 # 滚动窗口型指标: 实时=相对窗口均值的偏移 (踝角度区间: 实时=窗口内最大-最小), 最大/最小=窗口内极值
 RANGE_METRICS = ['knee_lateral', 'shoulder_lateral', 'hip_lateral', 'ankle_range']
 
-# 最小值型指标 (只追踪最小)
-MIN_METRICS = ['hip_closed']
+# 最小值型指标 (只追踪最小) — hip_closed 已并入 TRACK_STATS, 保留接口以备扩展
+MIN_METRICS = []
 
 
-def compute_all_metrics(pixels, angles, calib_pos=None):
+def compute_all_metrics(pixels, angles, calib_pos=None, facing=1):
     """计算当前帧的所有指标
 
     pixels: {jid_int: (x, y)}  8个关节像素坐标
     angles: {'elbow':v, 'shoulder':v, 'hip':v, 'knee':v, 'ankle':v}
     calib_pos: {jid_int: (x, y)}  标定位置
+    facing: +1 骑行者朝右 / -1 朝左; 水平类指标乘以此符号, 使"正=向前"与画面左右朝向无关
     返回 dict: {metric_name: value}
     """
     m = {name: None for name in METRIC_CN}
@@ -74,9 +76,9 @@ def compute_all_metrics(pixels, angles, calib_pos=None):
             m['back_angle'] = float(np.degrees(np.arctan2(dy, dx)))
 
     # --- 足膝偏移量 ---
-    # 膝(5)与踝(6)的水平距离 (px), 正=膝在前
+    # 膝(5)与踝(6)的水平距离 (px), 正=膝在前 (乘朝向符号统一方向)
     if 5 in p and 6 in p:
-        m['foot_knee_offset'] = p[5][0] - p[6][0]
+        m['foot_knee_offset'] = facing * (p[5][0] - p[6][0])
 
     # --- 偏摆量: X方向运动范围 ---
     # 实时值由 MetricsCollector 追踪历史后计算 range
@@ -87,10 +89,10 @@ def compute_all_metrics(pixels, angles, calib_pos=None):
     if 4 in p:
         m['hip_lateral'] = p[4][0]
 
-    # --- 髋关节位移 (相对标定) ---
+    # --- 髋关节位移 (相对标定) --- 水平位移乘朝向符号 (正=向前)
     if 4 in p and calib_pos and 4 in calib_pos:
         cx, cy = calib_pos[4]
-        m['hip_h_disp'] = p[4][0] - cx
+        m['hip_h_disp'] = facing * (p[4][0] - cx)
         m['hip_v_disp'] = p[4][1] - cy
 
     # --- 髋闭角角度 (髋关节最小角度 = 最大屈曲) ---
@@ -105,8 +107,9 @@ class MetricsCollector:
     def __init__(self):
         self.reset()
 
-    def reset(self, calib_pos=None):
+    def reset(self, calib_pos=None, facing=1):
         self._calib_pos = calib_pos or {}
+        self._facing = 1 if facing >= 0 else -1
         self._frame_count = 0
         self._revolutions = 0
 
@@ -135,7 +138,7 @@ class MetricsCollector:
             return self.get_display()
 
         self._frame_count += 1
-        m = compute_all_metrics(pixels, angles, self._calib_pos)
+        m = compute_all_metrics(pixels, angles, self._calib_pos, self._facing)
         p = {jid: (float(x), float(y)) for jid, (x, y) in pixels.items()}
 
         # 1. 圈数
@@ -152,19 +155,24 @@ class MetricsCollector:
         # 3. 偏摆量: 相对滚动均值的偏移 (实时 / 窗口最大 / 窗口最小)
         #    旧版取"从开始到现在的累计极差", 只增不减, 踩一圈后就不再变化
         new_sample = self._is_new_sample(p)
+        # 偏摆量: X 方向运动范围, 存入朝向校正后的 x (正=向前)
         for jid, metric in [(5, 'knee_lateral'), (3, 'shoulder_lateral'),
                              (4, 'hip_lateral')]:
             if jid not in p:
                 continue
             h = self._x_hist[jid]
+            xv = self._facing * p[jid][0]
             if new_sample:
-                h.append(p[jid][0])
+                h.append(xv)
             if len(h) > 1:
                 mean = sum(h) / len(h)
                 st = self._stats[metric]
-                st['cur'] = p[jid][0] - mean
+                cur = xv - mean
+                st['cur'] = cur
                 st['max'] = max(h) - mean
                 st['min'] = min(h) - mean
+                st['sum'] += cur
+                st['cnt'] += 1
 
         # 4. 踝角度区间: 滚动窗口内 最大-最小 (实时), 并给出窗口内最大/最小角
         av = m.get('ankle_angle')
@@ -173,12 +181,17 @@ class MetricsCollector:
         if len(self._ank_hist) > 1:
             hi, lo = max(self._ank_hist), min(self._ank_hist)
             ar = self._stats['ankle_range']
-            ar['cur'], ar['max'], ar['min'] = hi - lo, hi, lo
+            rng = hi - lo
+            ar['cur'] = rng
+            ar['max'] = hi
+            ar['min'] = lo
+            ar['sum'] += rng
+            ar['cnt'] += 1
 
-        # 5. 髋闭角 = 最小髋角
+        # 5. 髋闭角 = 髋角 (追踪 max/min/avg: min=最大屈曲, max=最大伸展)
         hv = m.get('hip_closed')
         if hv is not None:
-            self._track_min('hip_closed', hv)
+            self._track('hip_closed', hv)
 
         return self.get_display()
 
@@ -252,6 +265,7 @@ class MetricsCollector:
             elif name in RANGE_METRICS:
                 entry['max'] = s.get('max')
                 entry['min'] = s.get('min')
+                entry['avg'] = (s['sum'] / s['cnt']) if s['cnt'] > 0 else None
             elif name == 'revolutions':
                 entry['cur'] = self._revolutions
             elif name in MIN_METRICS:
