@@ -50,6 +50,7 @@ from vision.circle_detection import find_circles_detailed, CircleCandidate
 from core.models import JointID
 from core.geometry import angle_2d
 from pose_analysis.tracking_engine import MotionPredictor, MarkerAssociator
+from pose_analysis.xray_skeleton import XraySkeleton
 from pose_analysis.rider_model import RiderModel
 from pose_analysis.front_knee_view import render_front_knee, FRONT_W, FRONT_H
 from pose_analysis.layer_mask import apply_layer_mask
@@ -804,6 +805,7 @@ class PoseAnalysisGUI(QMainWindow):
         self._tracker = MarkerTracker(
             max_jump=self._cfg.max_jump, max_lost_frames=self._cfg.max_lost_frames)
         self._smoother = AngleSmoother(self._cfg.smooth_window)
+        self._xray = XraySkeleton()   # 虚拟人体骨骼 (X 光全息风)
         self._motion = MotionPredictor()  # α-β 滤波器
         self._associator = MarkerAssociator(self._cfg)  # top-hat + 骨长约束匹配
         self._mp_tracker = MediaPipeTracker(self._cfg)  # MediaPipe AI 姿态追踪
@@ -1137,10 +1139,10 @@ class PoseAnalysisGUI(QMainWindow):
         ('foot_knee_offset',1,1, 1, 1),
         ('hip_h_disp',    1, 1, 1, 1),
         ('hip_v_disp',    1, 1, 1, 1),
-        ('knee_lateral',  1, 0, 0, 0),
-        ('shoulder_lateral',1,0,0,0),
-        ('hip_lateral',   1, 0, 0, 0),
-        ('ankle_range',   1, 0, 0, 0),
+        ('knee_lateral', 1, 1, 1, 0),
+        ('shoulder_lateral', 1, 1, 1, 0),
+        ('hip_lateral', 1, 1, 1, 0),
+        ('ankle_range', 1, 1, 1, 0),
         ('hip_closed',    1, 0, 1, 0),
     ]
 
@@ -1938,7 +1940,13 @@ class PoseAnalysisGUI(QMainWindow):
         t1 = time.perf_counter()
 
         h, w = frame.shape[:2]
-        vis = draw_visual(apply_layer_mask(frame), pixels, angles, ranges,
+        xr_other = None
+        _rd = getattr(self, "_rider", None)
+        if _rd is not None and pixels.get(4) is not None:
+            xr_other = _rd.other_leg_px(pixels[4])     # 另一条腿 (相位估计)
+        base = (self._xray.render(apply_layer_mask(frame), pixels, angles, ranges, xr_other)
+                if self._calibrated else apply_layer_mask(frame))
+        vis = draw_visual(base, pixels, angles, ranges,
                           missing=missing, frame_idx=idx)
         if DEBUG_TRACK:
             self._draw_debug(vis, pixels)

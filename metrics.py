@@ -7,7 +7,12 @@
 
 关节编号: 1腕 2肘 3肩 4髋 5膝 6踝 7脚跟 8趾骨
 """
+from collections import deque
+
 import numpy as np
+
+# 偏摆 / 踝角度区间 的滚动窗口: 最近 N 个"不重复"采样 (重复帧不计入, 相机/视频都适用)
+SWAY_WINDOW = 90
 
 # 指标中文名
 METRIC_CN = {
@@ -33,7 +38,7 @@ TRACK_STATS = [
     'back_angle', 'foot_knee_offset', 'hip_h_disp', 'hip_v_disp',
 ]
 
-# 范围型指标 (只显示一个值)
+# 滚动窗口型指标: 实时=相对窗口均值的偏移 (踝角度区间: 实时=窗口内最大-最小), 最大/最小=窗口内极值
 RANGE_METRICS = ['knee_lateral', 'shoulder_lateral', 'hip_lateral', 'ankle_range']
 
 # 最小值型指标 (只追踪最小)
@@ -118,8 +123,11 @@ class MetricsCollector:
             self._stats[name] = {'cur': None, 'max': None,
                                  'min': None, 'sum': 0.0, 'cnt': 0}
 
-        # X方向历史 (偏摆量计算)
-        self._x_hist = {5: [], 3: [], 4: []}
+        # 滚动窗口 (有限长度, 不再无限增长): X 方向位置 / 踝角度
+        self._x_hist = {5: deque(maxlen=SWAY_WINDOW), 3: deque(maxlen=SWAY_WINDOW),
+                        4: deque(maxlen=SWAY_WINDOW)}
+        self._ank_hist = deque(maxlen=SWAY_WINDOW)
+        self._last_key = None
 
     def update(self, pixels, angles):
         """采集一帧数据, 返回显示用 dict"""
@@ -141,19 +149,31 @@ class MetricsCollector:
             if v is not None:
                 self._track(name, v)
 
-        # 3. 偏摆量 = X方向 range
+        # 3. 偏摆量: 相对滚动均值的偏移 (实时 / 窗口最大 / 窗口最小)
+        #    旧版取"从开始到现在的累计极差", 只增不减, 踩一圈后就不再变化
+        new_sample = self._is_new_sample(p)
         for jid, metric in [(5, 'knee_lateral'), (3, 'shoulder_lateral'),
                              (4, 'hip_lateral')]:
-            if jid in p:
-                self._x_hist[jid].append(p[jid][0])
-                xs = self._x_hist[jid]
-                if len(xs) > 1:
-                    self._stats[metric]['cur'] = max(xs) - min(xs)
+            if jid not in p:
+                continue
+            h = self._x_hist[jid]
+            if new_sample:
+                h.append(p[jid][0])
+            if len(h) > 1:
+                mean = sum(h) / len(h)
+                st = self._stats[metric]
+                st['cur'] = p[jid][0] - mean
+                st['max'] = max(h) - mean
+                st['min'] = min(h) - mean
 
-        # 4. 踝角度区间 = max - min
-        ank = self._stats['ankle_angle']
-        if ank['max'] is not None and ank['min'] is not None:
-            self._stats['ankle_range']['cur'] = ank['max'] - ank['min']
+        # 4. 踝角度区间: 滚动窗口内 最大-最小 (实时), 并给出窗口内最大/最小角
+        av = m.get('ankle_angle')
+        if av is not None and new_sample:
+            self._ank_hist.append(av)
+        if len(self._ank_hist) > 1:
+            hi, lo = max(self._ank_hist), min(self._ank_hist)
+            ar = self._stats['ankle_range']
+            ar['cur'], ar['max'], ar['min'] = hi - lo, hi, lo
 
         # 5. 髋闭角 = 最小髋角
         hv = m.get('hip_closed')
@@ -161,6 +181,15 @@ class MetricsCollector:
             self._track_min('hip_closed', hv)
 
         return self.get_display()
+
+    def _is_new_sample(self, p):
+        """与上一采样相比关节位置有变化才算新采样 (视频重复帧 / 相机重复读取不计入窗口)"""
+        key = tuple(round(p[j][k], 1) if j in p else 0.0 for j in (3, 4, 5, 6) for k in (0, 1))
+        if self._last_key is not None and max(
+                abs(a - b) for a, b in zip(key, self._last_key)) < 0.6:
+            return False
+        self._last_key = key
+        return True
 
     def _track(self, name, v):
         s = self._stats[name]
@@ -221,7 +250,8 @@ class MetricsCollector:
                 entry['min'] = s.get('min')
                 entry['avg'] = (s['sum'] / s['cnt']) if s['cnt'] > 0 else None
             elif name in RANGE_METRICS:
-                entry['max'] = s.get('cur')  # range value
+                entry['max'] = s.get('max')
+                entry['min'] = s.get('min')
             elif name == 'revolutions':
                 entry['cur'] = self._revolutions
             elif name in MIN_METRICS:
