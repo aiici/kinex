@@ -176,11 +176,11 @@ def render_front_knee(state, size=(FRONT_W, FRONT_H)):
 
 # ───────────────────────── 预览 (合成踩踏) ─────────────────────────
 
-def _synthetic_pixels(phase, ox=300.0, oy=250.0, thigh=114.0, shank=116.0, crank=60.0):
+def _synthetic_pixels(phase, ox=300.0, oy=250.0, thigh=114.0, shank=116.0, crank=45.0):
     """侧视图合成数据: 曲柄中心在髋下方, 踝点绕曲柄转, 膝由两段骨长解出"""
     oy = oy + 3.0 * math.sin(2 * phase)                  # 髋随蹬踏上下起伏
     hip = np.array([ox, oy])
-    cc = np.array([ox - 20.0, 470.0])
+    cc = np.array([ox - 10.0, oy + 175.0])        # 曲柄中心: 脚在最低点时腿未完全伸直
     ankle = cc + crank * np.array([math.cos(phase), math.sin(phase)])
     d = np.linalg.norm(ankle - hip)
     a = (thigh ** 2 - shank ** 2 + d ** 2) / (2 * d)

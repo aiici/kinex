@@ -6,10 +6,24 @@
   髋关节水平位移、髋关节垂直位移、髋关节偏摆量、踝角度变化区间、髋闭角角度
 
 关节编号: 1腕 2肘 3肩 4髋 5膝 6踝 7脚跟 8趾骨
+
+约定:
+  · 所有"前后"量按骑行者朝向取符号: 向前为正 (reset(calib_pos, facing) 的 facing=+1 朝右 / -1 朝左;
+    不传 facing 时按标定点自动判断); 竖直量向上为正
+  · 长度量统一换算成 cm: 以标定时 髋-膝(大腿) 的像素长度对应 THIGH_CM (默认 43 cm,
+    环境变量 KINEX_THIGH_CM 可改; 设为 0 则保持像素)。每个相机各算各的比例
+  · 足膝偏移量(实时) = 膝相对踏轴的水平偏移; KOPS值 = 曲柄水平朝前 (3 点钟) 时的足膝偏移。
+    踏轴用趾骨点(8)近似 (环境变量 KINEX_SPINDLE 可改成 6/7)
+  · 双相机: 每个相机一个 MetricsCollector, 用 BilateralMetrics 汇总 (圈数只取一侧, 不重复计数)
 """
+import math
+import os
 from collections import deque
 
 import numpy as np
+
+THIGH_CM = float(os.environ.get("KINEX_THIGH_CM", "43"))
+SPINDLE = int(os.environ.get("KINEX_SPINDLE", "8"))
 
 # 偏摆 / 踝角度区间 的滚动窗口: 最近 N 个"不重复"采样 (重复帧不计入, 相机/视频都适用)
 SWAY_WINDOW = 90
@@ -23,6 +37,7 @@ METRIC_CN = {
     'elbow_angle': '手肘角度',
     'back_angle': '水平背角度',
     'foot_knee_offset': '足膝偏移量',
+    'kops': 'KOPS值',
     'knee_lateral': '膝关节偏摆',
     'shoulder_lateral': '肩关节偏摆',
     'hip_h_disp': '髋水平位移',
@@ -36,7 +51,7 @@ METRIC_CN = {
 TRACK_STATS = [
     'knee_angle', 'ankle_angle', 'shoulder_angle', 'elbow_angle',
     'back_angle', 'foot_knee_offset', 'hip_h_disp', 'hip_v_disp',
-    'hip_closed',
+    'hip_closed', 'kops',
 ]
 
 # 滚动窗口型指标: 实时=相对窗口均值的偏移 (踝角度区间: 实时=窗口内最大-最小), 最大/最小=窗口内极值
@@ -46,13 +61,14 @@ RANGE_METRICS = ['knee_lateral', 'shoulder_lateral', 'hip_lateral', 'ankle_range
 MIN_METRICS = []
 
 
-def compute_all_metrics(pixels, angles, calib_pos=None, facing=1):
+def compute_all_metrics(pixels, angles, calib_pos=None, facing=1, k=1.0, spindle=SPINDLE):
     """计算当前帧的所有指标
 
     pixels: {jid_int: (x, y)}  8个关节像素坐标
     angles: {'elbow':v, 'shoulder':v, 'hip':v, 'knee':v, 'ankle':v}
     calib_pos: {jid_int: (x, y)}  标定位置
     facing: +1 骑行者朝右 / -1 朝左; 水平类指标乘以此符号, 使"正=向前"与画面左右朝向无关
+    k: cm / px 比例 (长度类指标乘以它)
     返回 dict: {metric_name: value}
     """
     m = {name: None for name in METRIC_CN}
@@ -76,9 +92,10 @@ def compute_all_metrics(pixels, angles, calib_pos=None, facing=1):
             m['back_angle'] = float(np.degrees(np.arctan2(dy, dx)))
 
     # --- 足膝偏移量 ---
-    # 膝(5)与踝(6)的水平距离 (px), 正=膝在前 (乘朝向符号统一方向)
-    if 5 in p and 6 in p:
-        m['foot_knee_offset'] = facing * (p[5][0] - p[6][0])
+    # 膝(5)相对踏轴(默认趾骨点 8)的水平偏移 (cm), 向前为正; 标准 KOPS 值见 'kops'
+    sp = spindle if spindle in p else (6 if 6 in p else None)
+    if 5 in p and sp is not None:
+        m['foot_knee_offset'] = facing * (p[5][0] - p[sp][0]) * k
 
     # --- 偏摆量: X方向运动范围 ---
     # 实时值由 MetricsCollector 追踪历史后计算 range
@@ -92,8 +109,8 @@ def compute_all_metrics(pixels, angles, calib_pos=None, facing=1):
     # --- 髋关节位移 (相对标定) --- 水平位移乘朝向符号 (正=向前)
     if 4 in p and calib_pos and 4 in calib_pos:
         cx, cy = calib_pos[4]
-        m['hip_h_disp'] = facing * (p[4][0] - cx)
-        m['hip_v_disp'] = p[4][1] - cy
+        m['hip_h_disp'] = facing * (p[4][0] - cx) * k          # 向前为正 (cm)
+        m['hip_v_disp'] = -(p[4][1] - cy) * k                  # 向上为正 (cm)
 
     # --- 髋闭角角度 (髋关节最小角度 = 最大屈曲) ---
     m['hip_closed'] = angles.get('hip')
@@ -107,9 +124,12 @@ class MetricsCollector:
     def __init__(self):
         self.reset()
 
-    def reset(self, calib_pos=None, facing=1):
+    def reset(self, calib_pos=None, facing=None):
+        """facing: +1 朝右 / -1 朝左 (与 app 的 _facing_sign 一致); None = 按标定点自动判断"""
         self._calib_pos = calib_pos or {}
-        self._facing = 1 if facing >= 0 else -1
+        g_facing, self.k, self._thigh_px = self._geometry(self._calib_pos)
+        self._facing_given = facing is not None
+        self._facing = (1 if facing >= 0 else -1) if self._facing_given else int(g_facing)
         self._frame_count = 0
         self._revolutions = 0
 
@@ -118,7 +138,7 @@ class MetricsCollector:
         self._ky_dir = 0       # -1=上移(y减), +1=下移(y增)
         self._last_bottom = None  # 上次谷底(踏板下死点, y最大)
         self._last_top = None    # 上次峰顶(踏板上死点, y最小)
-        self._amp_thresh = 15   # 最小振幅(px), 过滤噪声
+        self._amp_thresh = 0.13 * self._thigh_px if self._thigh_px else 15   # 最小振幅(px): 随画面比例缩放
 
         # 指标统计 {name: {cur, max, min, sum, cnt}}
         self._stats = {}
@@ -132,14 +152,24 @@ class MetricsCollector:
         self._ank_hist = deque(maxlen=SWAY_WINDOW)
         self._last_key = None
 
+        # 曲柄 (踏轴点轨迹) → KOPS: 曲柄水平朝前时测量
+        self._cr_ring = deque(maxlen=200)
+        self._cr_hist = deque(maxlen=3)            # (e, 实时足膝偏移), e = 曲柄角 - 朝前水平角
+
     def update(self, pixels, angles):
         """采集一帧数据, 返回显示用 dict"""
         if not pixels or len(pixels) < 3:
             return self.get_display()
 
         self._frame_count += 1
-        m = compute_all_metrics(pixels, angles, self._calib_pos, self._facing)
         p = {jid: (float(x), float(y)) for jid, (x, y) in pixels.items()}
+        if self._thigh_px is None:                  # 未经标定直接使用: 用首帧推算比例 (和朝向, 若未指定)
+            g_facing, self.k, self._thigh_px = self._geometry(p)
+            if not self._facing_given:
+                self._facing = int(g_facing)
+            if self._thigh_px:
+                self._amp_thresh = 0.13 * self._thigh_px
+        m = compute_all_metrics(pixels, angles, self._calib_pos, self._facing, self.k)
 
         # 1. 圈数
         if 5 in p:
@@ -161,7 +191,7 @@ class MetricsCollector:
             if jid not in p:
                 continue
             h = self._x_hist[jid]
-            xv = self._facing * p[jid][0]
+            xv = self._facing * p[jid][0] * self.k
             if new_sample:
                 h.append(xv)
             if len(h) > 1:
@@ -193,7 +223,67 @@ class MetricsCollector:
         if hv is not None:
             self._track('hip_closed', hv)
 
+        # 6. KOPS: 曲柄水平朝前 (3 点钟) 时, 膝相对踏轴的水平偏移
+        if new_sample:
+            self._update_kops(p, m.get('foot_knee_offset'))
+
         return self.get_display()
+
+    @staticmethod
+    def _geometry(pos):
+        """由一组关节位置得到 (朝向, cm/px, 大腿像素长度); 位置不足时 (1.0, 1.0, None)"""
+        pos = {int(j): (float(v[0]), float(v[1])) for j, v in (pos or {}).items()}
+        facing = 1.0
+        if 7 in pos and 8 in pos:                       # 与 app 一致: 趾骨在脚跟前方 → 朝右
+            facing = 1.0 if pos[8][0] > pos[7][0] else -1.0
+        else:
+            ref = pos.get(1) or pos.get(3)
+            if ref is not None and 4 in pos:
+                facing = 1.0 if ref[0] >= pos[4][0] else -1.0
+        thigh = None
+        if 4 in pos and 5 in pos:
+            d = math.hypot(pos[4][0] - pos[5][0], pos[4][1] - pos[5][1])
+            thigh = d if d > 10 else None
+        k = (THIGH_CM / thigh) if (thigh and THIGH_CM > 0) else 1.0
+        return facing, k, thigh
+
+    def _crank_center(self):
+        """曲柄中心: 对踏轴点轨迹做最小二乘圆拟合 (不要求覆盖整数圈); 点太集中时退回均值"""
+        pts = np.asarray(self._cr_ring, float)
+        mx, my = pts.mean(axis=0)
+        if np.ptp(pts[:, 0]) < 8 and np.ptp(pts[:, 1]) < 8:
+            return float(mx), float(my)
+        x, y = pts[:, 0] - mx, pts[:, 1] - my
+        A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
+        sol, *_ = np.linalg.lstsq(A, x * x + y * y, rcond=None)
+        return float(mx + sol[0]), float(my + sol[1])
+
+    def _update_kops(self, p, live_offset):
+        """踏轴点绕曲柄中心转: 曲柄角经过"水平朝前"时, 用相邻 3 个采样做二次插值得到该时刻的足膝偏移"""
+        sp = SPINDLE if SPINDLE in p else (6 if 6 in p else None)
+        if sp is None or live_offset is None:
+            return
+        self._cr_ring.append(p[sp])
+        if len(self._cr_ring) < 8:
+            return
+        cx, cy = self._crank_center()
+        theta = math.atan2(p[sp][1] - cy, p[sp][0] - cx)
+        phi_f = 0.0 if self._facing > 0 else math.pi             # 曲柄指向前方水平
+        e = (theta - phi_f + math.pi) % (2 * math.pi) - math.pi
+        if self._cr_hist:
+            e0, v0 = self._cr_hist[-1]
+            # 过零且方向为向前蹬踏 (朝右时角度增大, 朝左时减小), 排除跨 ±π 的跳变
+            if e0 * e < 0 and abs(e - e0) < math.pi and (e - e0) * self._facing > 0:
+                pts = list(self._cr_hist) + [(e, live_offset)]
+                if len(pts) >= 3:
+                    (a, va), (b, vb), (c, vc) = pts[-3:]
+                    v = (va * (0 - b) * (0 - c) / ((a - b) * (a - c)) +
+                         vb * (0 - a) * (0 - c) / ((b - a) * (b - c)) +
+                         vc * (0 - a) * (0 - b) / ((c - a) * (c - b)))
+                else:
+                    v = v0 + (live_offset - v0) * (0 - e0) / (e - e0)
+                self._track('kops', v)
+        self._cr_hist.append((e, live_offset))
 
     def _is_new_sample(self, p):
         """与上一采样相比关节位置有变化才算新采样 (视频重复帧 / 相机重复读取不计入窗口)"""
@@ -273,3 +363,63 @@ class MetricsCollector:
                 entry['cur'] = s.get('cur')
             result[name] = entry
         return result
+
+
+class BilateralMetrics:
+    """双相机 (左 / 右侧各一台) 汇总:
+        · 每侧一个 MetricsCollector, 各自的朝向、cm/px 比例、窗口和曲柄角, 互不混用
+        · 圈数只取"主侧"一个, 不会因为两台相机而重复计数
+        · 单相机时只有一侧有数据, 另一侧的估计值 (正面图里的虚线腿) 不进入任何统计
+        · asymmetry(): 左 - 右 的差值, 两侧都有数据时才有
+    """
+    # 左右差只比较"稳定的统计量", 不比较瞬时值 (两条腿相位差半圈, 瞬时值必然不同)
+    ASYM_COL = {'knee_angle': 'avg', 'ankle_angle': 'avg', 'elbow_angle': 'avg',
+                'shoulder_angle': 'avg', 'back_angle': 'avg',
+                'hip_closed': 'min',            # 髋闭角: 各侧的最小值
+                'kops': 'avg'}                  # 3 点钟足膝偏移: 各侧的平均
+
+    def __init__(self, primary='R'):
+        self.sides = {'L': MetricsCollector(), 'R': MetricsCollector()}
+        self.primary = primary
+        self._frames = {'L': 0, 'R': 0}
+
+    def reset(self, calib_by_side=None, facing_by_side=None):
+        calib_by_side = calib_by_side or {}
+        facing_by_side = facing_by_side or {}
+        for s in ('L', 'R'):
+            self.sides[s].reset(calib_by_side.get(s), facing_by_side.get(s))
+            self._frames[s] = 0
+
+    def update(self, side, pixels, angles):
+        self._frames[side] += 1
+        return self.sides[side].update(pixels, angles)
+
+    def active_sides(self):
+        return [s for s in ('L', 'R') if self._frames[s] > 0]
+
+    def primary_side(self):
+        act = self.active_sides()
+        if len(act) == 1:
+            return act[0]
+        return self.primary if self.primary in act or not act else act[0]
+
+    def revolutions(self):
+        return self.sides[self.primary_side()]._revolutions
+
+    def get_display(self, side=None):
+        side = side or self.primary_side()
+        d = self.sides[side].get_display()
+        d['revolutions'] = {'cur': self.revolutions()}
+        return d
+
+    def asymmetry(self):
+        """{指标: 左 - 右}; 各指标取 ASYM_COL 指定的统计列, 缺一侧返回 {}"""
+        if len(self.active_sides()) < 2:
+            return {}
+        L, R = (self.sides[s].get_display() for s in ('L', 'R'))
+        out = {}
+        for key, col in self.ASYM_COL.items():
+            a, b = L.get(key, {}).get(col), R.get(key, {}).get(col)
+            if a is not None and b is not None:
+                out[key] = a - b
+        return out

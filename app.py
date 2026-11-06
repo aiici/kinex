@@ -489,7 +489,7 @@ def compute_angles(pixels):
         ax, ay = pts[JointID.ANKLE]
         hx, hy = pts[JointID.HEEL]
         px, py = pts[JointID.PHALANX]
-        v1 = np.array([ax - kx, ay - ky])
+        v1 = np.array([kx - ax, ky - ay])   # 踝→膝 (小腿朝上); 与 脚跟→趾骨 夹角: 中立 90°, 跖屈 >90°
         v2 = np.array([px - hx, py - hy])
         n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
         if n1 > 1e-6 and n2 > 1e-6:
@@ -1138,6 +1138,7 @@ class PoseAnalysisGUI(QMainWindow):
         ('elbow_angle',   1, 1, 1, 1),
         ('back_angle',    1, 1, 1, 1),
         ('foot_knee_offset',1,1, 1, 1),
+        ('kops', 1, 1, 1, 1),
         ('hip_h_disp',    1, 1, 1, 1),
         ('hip_v_disp',    1, 1, 1, 1),
         ('knee_lateral', 1, 1, 1, 1),
